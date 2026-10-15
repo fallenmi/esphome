@@ -183,7 +183,6 @@ void MipiDsi::update() {
   if (this->auto_clear_enabled_) {
     this->clear();
   }
-  // Blocks drawn by the writer stay in the buffer until the one flush below
   this->updating_ = true;
   if (this->show_test_card_) {
     this->test_card();
@@ -198,14 +197,9 @@ void MipiDsi::update() {
   this->flush_dirty_();
 }
 
-// Outside update() nothing else would flush, inside it the end of update() does.
-void MipiDsi::flush_now_() {
-  if (!this->updating_)
-    this->flush_dirty_();
-}
-
 void MipiDsi::flush_dirty_() {
-  if (this->buffer_ == nullptr || this->x_low_ > this->x_high_ || this->y_low_ > this->y_high_)
+  // Inside update() the one flush at its end sends everything
+  if (this->updating_ || this->buffer_ == nullptr || this->x_low_ > this->x_high_ || this->y_low_ > this->y_high_)
     return;
   ESP_LOGV(TAG, "x_low %d, y_low %d, x_high %d, y_high %d", this->x_low_, this->y_low_, this->x_high_, this->y_high_);
   int w = this->x_high_ - this->x_low_ + 1;
@@ -223,23 +217,18 @@ void MipiDsi::draw_pixels_at(int x_start, int y_start, int w, int h, const uint8
                              display::ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) {
   if (w <= 0 || h <= 0)
     return;
-  // Copy as is only when the bytes are laid out the way draw_pixel_at() writes them; an RGB
-  // ordered little endian 888 block is b,g,r in memory. Anything else, or a block drawn under a clipping
-  // region, goes per pixel.
-  const bool same_layout = bitness == display::COLOR_BITNESS_565
-                               ? big_endian == this->big_endian_
-                               : big_endian == (this->color_mode_ == display::COLOR_ORDER_RGB);
+  // 888 is always b,g,r in memory, so only 565 has a byte order to match
+  const bool same_layout = bitness != display::COLOR_BITNESS_565 || big_endian == this->big_endian_;
   if (bitness != this->color_depth_ || order != display::COLOR_ORDER_RGB || !same_layout ||
       this->rotation_ != display::DISPLAY_ROTATION_0_DEGREES || this->is_clipping()) {
     display::Display::draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, x_offset, y_offset,
                                      x_pad);
     this->mark_dirty_(x_start, y_start, w, h);
-    this->flush_now_();
+    this->flush_dirty_();
     return;
   }
   if (this->buffer_ != nullptr) {
     // With a buffer the block goes through it, or a flush of the old contents would paint over it
-    // Only the part on the panel
     const int first_col = std::max(0, -x_start), end_col = std::min(w, static_cast<int>(this->width_) - x_start);
     const int first_row = std::max(0, -y_start), end_row = std::min(h, static_cast<int>(this->height_) - y_start);
     if (first_col >= end_col || first_row >= end_row)
@@ -251,8 +240,12 @@ void MipiDsi::draw_pixels_at(int x_start, int y_start, int w, int h, const uint8
              ptr + ((y_offset + y) * stride + x_offset + first_col) * bytes_per_pixel,
              (end_col - first_col) * bytes_per_pixel);
     }
-    this->mark_dirty_(x_start + first_col, y_start + first_row, end_col - first_col, end_row - first_row);
-    this->flush_now_();
+    if (this->updating_) {
+      this->mark_dirty_(x_start + first_col, y_start + first_row, end_col - first_col, end_row - first_row);
+    } else {
+      this->write_to_display_(x_start + first_col, y_start + first_row, end_col - first_col, end_row - first_row, ptr,
+                              x_offset + first_col, y_offset + first_row, x_pad + w - end_col);
+    }
     return;
   }
   this->write_to_display_(x_start, y_start, w, h, ptr, x_offset, y_offset, x_pad);
@@ -298,26 +291,6 @@ bool MipiDsi::check_buffer_() {
     return false;
   }
   return true;
-}
-
-// Maps drawn coordinates to the buffer the way draw_pixel_at() stores them.
-void MipiDsi::rotate_(int &x, int &y) const {
-  switch (this->rotation_) {
-    case display::DISPLAY_ROTATION_0_DEGREES:
-      break;
-    case display::DISPLAY_ROTATION_90_DEGREES:
-      std::swap(x, y);
-      x = this->width_ - x - 1;
-      break;
-    case display::DISPLAY_ROTATION_180_DEGREES:
-      x = this->width_ - x - 1;
-      y = this->height_ - y - 1;
-      break;
-    case display::DISPLAY_ROTATION_270_DEGREES:
-      std::swap(x, y);
-      y = this->height_ - y - 1;
-      break;
-  }
 }
 
 // Widen the dirty box to the drawn rectangle, even where the buffer already held the same values.
@@ -367,15 +340,10 @@ void MipiDsi::draw_pixel_at(int x, int y, Color color) {
       break;
     }
     case display::COLOR_BITNESS_888:
-      if (this->color_mode_ == display::COLOR_ORDER_BGR) {
-        this->buffer_[pos * 3] = color.b;
-        this->buffer_[pos * 3 + 1] = color.g;
-        this->buffer_[pos * 3 + 2] = color.r;
-      } else {
-        this->buffer_[pos * 3] = color.r;
-        this->buffer_[pos * 3 + 1] = color.g;
-        this->buffer_[pos * 3 + 2] = color.b;
-      }
+      // The panel applies the colour order, so the buffer keeps the standard b,g,r layout
+      this->buffer_[pos * 3] = color.b;
+      this->buffer_[pos * 3 + 1] = color.g;
+      this->buffer_[pos * 3 + 2] = color.r;
       break;
     case display::COLOR_BITNESS_332:
       break;
@@ -409,19 +377,12 @@ void MipiDsi::fill(Color color) {
     }
 
     case display::COLOR_BITNESS_888:
-      if (this->color_mode_ == display::COLOR_ORDER_BGR) {
-        for (size_t i = 0; i != this->width_ * this->height_; i++) {
-          this->buffer_[i * 3 + 0] = color.b;
-          this->buffer_[i * 3 + 1] = color.g;
-          this->buffer_[i * 3 + 2] = color.r;
-        }
-      } else {
-        for (size_t i = 0; i != this->width_ * this->height_; i++) {
-          this->buffer_[i * 3 + 0] = color.r;
-          this->buffer_[i * 3 + 1] = color.g;
-          this->buffer_[i * 3 + 2] = color.b;
-        }
+      for (size_t i = 0; i != this->width_ * this->height_; i++) {
+        this->buffer_[i * 3 + 0] = color.b;
+        this->buffer_[i * 3 + 1] = color.g;
+        this->buffer_[i * 3 + 2] = color.r;
       }
+      break;
 
     default:
       break;
